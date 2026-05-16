@@ -8,7 +8,7 @@ from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 
 app = FastAPI(title="pokemon-card-min-price", version="0.1.0")
 
@@ -162,20 +162,10 @@ def _usd_to_brl(usd: float) -> Optional[float]:
     return usd * 5.2
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.post("/estimate")
-async def estimate(file: UploadFile = File(...)):
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="arquivo vazio")
-
-    card = _extract_card_with_openai(content)
+def _estimate_value_from_image_bytes(image_bytes: bytes, filename: str) -> str:
+    card = _extract_card_with_openai(image_bytes)
     if not card:
-        card = _extract_card_hint(file.filename or "")
+        card = _extract_card_hint(filename or "")
 
     if not card:
         raise HTTPException(
@@ -193,6 +183,96 @@ async def estimate(file: UploadFile = File(...)):
 
     brl = _usd_to_brl(usd)
     value = round(brl, 2)
+    return f"R$ {value:.2f}".replace('.', ',')
 
+
+def _telegram_api_url(method: str) -> str:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
+    return f"https://api.telegram.org/bot{token}/{method}"
+
+
+def _telegram_file_url(file_path: str) -> str:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
+    return f"https://api.telegram.org/file/bot{token}/{file_path}"
+
+
+def _telegram_send_message(chat_id: int, text: str) -> None:
+    with httpx.Client(timeout=20) as client:
+        client.post(_telegram_api_url("sendMessage"), json={"chat_id": chat_id, "text": text})
+
+
+def _telegram_download_photo(file_id: str) -> tuple[bytes, str]:
+    with httpx.Client(timeout=30) as client:
+        file_info = client.get(_telegram_api_url("getFile"), params={"file_id": file_id})
+        file_info.raise_for_status()
+        data = file_info.json()
+        path = data.get("result", {}).get("file_path")
+        if not path:
+            raise RuntimeError("Não consegui obter file_path do Telegram")
+
+        img = client.get(_telegram_file_url(path))
+        img.raise_for_status()
+
+    filename = path.split("/")[-1] if "/" in path else "telegram_photo.jpg"
+    return img.content, filename
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/estimate")
+async def estimate(file: UploadFile = File(...)):
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="arquivo vazio")
+
+    value = _estimate_value_from_image_bytes(content, file.filename or "")
     # resposta mínima pedida: valor estimado pelo menor valor de venda
-    return {"value": f"R$ {value:.2f}".replace('.', ',')}
+    return {"value": value}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    payload = await request.json()
+    message = payload.get("message") or payload.get("edited_message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+
+    photos = message.get("photo") or []
+    if not chat_id:
+        return {"ok": True}
+
+    if not photos:
+        _telegram_send_message(chat_id, "Envie uma foto da carta.")
+        return {"ok": True}
+
+    # Telegram envia múltiplos tamanhos; o último costuma ser o maior.
+    biggest = photos[-1]
+    file_id = biggest.get("file_id")
+    if not file_id:
+        _telegram_send_message(chat_id, "Não consegui ler essa foto. Tente novamente.")
+        return {"ok": True}
+
+    try:
+        image_bytes, filename = _telegram_download_photo(file_id)
+        value = _estimate_value_from_image_bytes(image_bytes, filename)
+        # Resposta mínima solicitada: apenas o valor.
+        _telegram_send_message(chat_id, value)
+    except Exception:
+        _telegram_send_message(chat_id, "Não consegui estimar essa carta agora.")
+
+    return {"ok": True}
+
+
+@app.post("/telegram/set-webhook")
+def telegram_set_webhook(webhook_url: str):
+    with httpx.Client(timeout=20) as client:
+        r = client.post(_telegram_api_url("setWebhook"), json={"url": webhook_url})
+        r.raise_for_status()
+        return r.json()
