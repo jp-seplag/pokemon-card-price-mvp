@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import re
 from dataclasses import dataclass
@@ -7,8 +8,10 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import pytesseract
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from PIL import Image, ImageEnhance, ImageFilter
 
 app = FastAPI(title="pokemon-card-min-price", version="0.1.0")
 
@@ -52,62 +55,48 @@ def _extract_card_hint(filename: str) -> Optional[CardMatch]:
     return CardMatch(name=name, number=number)
 
 
-def _extract_card_with_openai(image_bytes: bytes) -> Optional[CardMatch]:
+def _extract_card_with_tesseract(image_bytes: bytes) -> Optional[CardMatch]:
     """
-    Opcional: usa OpenAI vision quando OPENAI_API_KEY estiver presente.
-    Retorna JSON esperado: {"name":"Darkrai GX","number":"88/147"}
+    Extração local via OCR (Tesseract), sem uso de API paga.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-
-    import base64
-
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    payload = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "messages": [
-            {
-                "role": "system",
-                "content": "Extract Pokemon card name and collector number from image. Respond JSON only with keys name and number.",
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Return strictly JSON: {\"name\":...,\"number\":...}"},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    },
-                ],
-            },
-        ],
-        "temperature": 0,
-    }
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    with httpx.Client(timeout=40) as client:
-        resp = client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-        if resp.status_code >= 300:
-            return None
-        data = resp.json()
-
-    content = data["choices"][0]["message"]["content"]
-    m = re.search(r"\{[\s\S]*\}", content)
-    if not m:
-        return None
-
-    import json
-
     try:
-        parsed = json.loads(m.group(0))
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
     except Exception:
         return None
 
-    name = (parsed.get("name") or "").strip()
-    number = (parsed.get("number") or "").strip() or None
-    if not name:
+    # Pré-processamento simples para melhorar OCR
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = img.filter(ImageFilter.SHARPEN)
+
+    try:
+        text = pytesseract.image_to_string(img, lang="eng+por")
+    except Exception:
+        try:
+            text = pytesseract.image_to_string(img, lang="eng")
+        except Exception:
+            return None
+
+    clean = re.sub(r"\s+", " ", text).strip()
+    if not clean:
         return None
+
+    # Número de coleção (ex: 88/147)
+    n = re.search(r"\b(\d{1,3})\s*/\s*(\d{1,3})\b", clean)
+    number = f"{n.group(1)}/{n.group(2)}" if n else None
+
+    # Nome da carta: tenta capturar algo como "Darkrai GX"
+    # Heurística: palavra inicial com maiúscula + sufixos comuns
+    candidates = re.findall(r"\b([A-Z][a-z]{2,15}(?:\s+(?:GX|EX|V|VMAX|VSTAR))?)\b", clean)
+    if not candidates:
+        # fallback: primeira palavra plausível
+        tokens = re.findall(r"[A-Za-z]{3,15}", clean)
+        if not tokens:
+            return None
+        name = tokens[0].capitalize()
+        return CardMatch(name=name, number=number)
+
+    # Escolhe o candidato mais longo (geralmente mais específico)
+    name = sorted(candidates, key=len, reverse=True)[0].strip()
     return CardMatch(name=name, number=number)
 
 
@@ -163,14 +152,14 @@ def _usd_to_brl(usd: float) -> Optional[float]:
 
 
 def _estimate_value_from_image_bytes(image_bytes: bytes, filename: str) -> str:
-    card = _extract_card_with_openai(image_bytes)
+    card = _extract_card_with_tesseract(image_bytes)
     if not card:
         card = _extract_card_hint(filename or "")
 
     if not card:
         raise HTTPException(
             status_code=422,
-            detail="Não consegui identificar a carta automaticamente. Renomeie o arquivo como nome-da-carta-88-147.jpg ou configure OPENAI_API_KEY.",
+            detail="Não consegui identificar a carta automaticamente. Tente uma foto mais nítida ou renomeie o arquivo como nome-da-carta-88-147.jpg.",
         )
 
     url = _search_pricecharting(card)
